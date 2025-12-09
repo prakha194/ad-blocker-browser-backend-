@@ -3,12 +3,10 @@
   "version": "1.0.0",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "dev": "NODE_ENV=development nodemon server.js",
-    "update-blocklists": "node scripts/update-blocklists.js"
+    "start": "node server.js"
   },
   "dependencies": {
-    "@cliqz/adblocker": "^2.1.2",
+    "@adguard/adblocker": "^0.5.2",
     "bcrypt": "^5.1.1",
     "cheerio": "^1.0.0-rc.12",
     "cookie-parser": "^1.4.6",
