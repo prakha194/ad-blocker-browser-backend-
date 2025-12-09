@@ -1,547 +1,149 @@
-/**
- * server.js - Full backend for Deep Browser (SQLite)
- *
- * - Serves static frontend from ./public (index.html + app.js)
- * - Serves admin UI from ./public/admin/admin.html (same origin -> cookies work)
- * - Admin setup/login/logout (first-time setup creates permanent password)
- * - Blocklist management: add/delete/toggle/upload/download/reload
- * - Proxy (sanitize), Search (Google CSE), History, simple Accounts API
- * - Uses SQLite (database.sqlite), no external DB required for now
- *
- * Env vars:
- * - API_TOKEN (required for /api/* calls)
- * - APP_SECRET (JWT secret for admin sessions)
- * - GOOGLE_API_KEY, GOOGLE_CX (optional for /api/search)
- * - BLOCKLIST_URLS (comma-separated list of external lists to merge)
- * - PORT (optional)
- *
- * Deployment: npm install && npm start
- */
+import express from "express";
+import cors from "cors";
+import dotenv from "dotenv";
+import mysql from "mysql2/promise";
+import axios from "axios";
 
-require('dotenv').config();
-
-const path = require('path');
-const fs = require('fs');
-const express = require('express');
-const helmet = require('helmet');
-const fetch = require('node-fetch');
-const rateLimit = require('express-rate-limit');
-const { Sequelize, DataTypes, Op } = require('sequelize');
-const multer = require('multer');
-const { parse: csvParse } = require('csv-parse/sync');
-const bcrypt = require('bcrypt');
-const jwt = require('jsonwebtoken');
-const cookieParser = require('cookie-parser');
-const cheerio = require('cheerio');
+dotenv.config();
 
 const app = express();
-app.use(express.json({ limit: '2mb' }));
-app.use(helmet());
-app.use(cookieParser());
+app.use(cors());
+app.use(express.json());
 
-// serve static frontend & admin from same origin
-app.use(express.static(path.join(__dirname, 'public')));
-app.use('/admin', express.static(path.join(__dirname, 'public', 'admin')));
-
-const PORT = process.env.PORT || 10000;
-const JWT_SECRET = process.env.APP_SECRET || 'change-this-secret';
-const JWT_EXP = '8h';
-const SALT_ROUNDS = 12;
-const BLOCKLIST_PATH = path.join(__dirname, 'blocklists.txt');
-const UPLOAD_DIR = path.join(__dirname, 'tmp');
-if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-const upload = multer({ dest: UPLOAD_DIR, limits: { fileSize: 20 * 1024 * 1024 } }); // 20MB
-
-// ---------- SQLite (Sequelize) ----------
-const SQLITE_FILE = path.join(__dirname, 'database.sqlite');
-const sequelize = new Sequelize({
-  dialect: 'sqlite',
-  storage: SQLITE_FILE,
-  logging: false
+// MySQL connection pool
+const db = await mysql.createPool({
+  host: process.env.MYSQL_HOST,
+  user: process.env.MYSQL_USER,
+  password: process.env.MYSQL_PASS,
+  database: process.env.MYSQL_DB,
+  waitForConnections: true,
+  connectionLimit: 10
 });
 
-// Models
-const Admin = sequelize.define('Admin', {
-  username: { type: DataTypes.STRING, unique: true, allowNull: false, defaultValue: 'admin' },
-  password_hash: { type: DataTypes.STRING, allowNull: false },
-  created_at: { type: DataTypes.DATE, defaultValue: DataTypes.NOW },
-  last_login: DataTypes.DATE
-}, { tableName: 'admins', timestamps: false });
-
-const BlockedDomain = sequelize.define('BlockedDomain', {
-  domain: { type: DataTypes.STRING(255), unique: true, allowNull: false },
-  source: DataTypes.STRING(255),
-  is_enabled: { type: DataTypes.BOOLEAN, defaultValue: true },
-  added_by: DataTypes.STRING(100),
-  added_at: { type: DataTypes.DATE, defaultValue: DataTypes.NOW }
-}, { tableName: 'blocked_domains', timestamps: false });
-
-const History = sequelize.define('History', {
-  userId: { type: DataTypes.STRING(128), allowNull: true },
-  url: { type: DataTypes.TEXT, allowNull: false },
-  title: DataTypes.STRING(1024),
-  snippet: DataTypes.TEXT,
-  visitedAt: { type: DataTypes.DATE, defaultValue: DataTypes.NOW },
-  isIncognito: { type: DataTypes.BOOLEAN, defaultValue: false },
-  ip_addr: DataTypes.STRING(45)
-}, { tableName: 'history', timestamps: false });
-
-const AdminAudit = sequelize.define('AdminAudit', {
-  admin_user: DataTypes.STRING(100),
-  action: DataTypes.STRING(255),
-  detail: DataTypes.TEXT,
-  ip: DataTypes.STRING(45),
-  created_at: { type: DataTypes.DATE, defaultValue: DataTypes.NOW }
-}, { tableName: 'admin_audit', timestamps: false });
-
-const UserProfile = sequelize.define('UserProfile', {
-  id: { type: DataTypes.STRING(128), primaryKey: true }, // client-generated uuid or random
-  name: DataTypes.STRING(200),
-  created_at: { type: DataTypes.DATE, defaultValue: DataTypes.NOW },
-  updated_at: DataTypes.DATE
-}, { tableName: 'user_profiles', timestamps: false });
-
-// ---------- Rate limiter ----------
-app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 1000 }));
-
-// ---------- Host-based blocklist ----------
-let hostBlockSet = new Set();
-
-function extractHostsFromRuleLine(line) {
-  line = (line || '').trim();
-  if (!line || line.startsWith('!') || line.startsWith('[') || line.startsWith('@')) return [];
-  const hosts = [];
-  const hostMatch = line.match(/^(?:0\.0\.0\.0|127\.0\.0\.1)\s+([^\s#]+)/);
-  if (hostMatch) { hosts.push(hostMatch[1].replace(/^www\./, '').toLowerCase()); return hosts; }
-  const abpHostMatch = line.match(/^\|\|([^\/\^\$]+)\^?/);
-  if (abpHostMatch) { hosts.push(abpHostMatch[1].replace(/^www\./, '').toLowerCase()); return hosts; }
-  if (/^[a-z0-9\.\-]+$/i.test(line)) { hosts.push(line.replace(/^www\./, '').toLowerCase()); return hosts; }
-  try { if (line.startsWith('http://') || line.startsWith('https://')) { const u = new URL(line); hosts.push(u.hostname.replace(/^www\./, '').toLowerCase()); return hosts; } } catch (e) {}
-  return hosts;
-}
-
-function loadBlocklistsFromFile() {
-  hostBlockSet = new Set();
+// Utility: Remove tracking parameters
+function cleanUrl(url) {
   try {
-    if (!fs.existsSync(BLOCKLIST_PATH)) return;
-    const txt = fs.readFileSync(BLOCKLIST_PATH, 'utf8');
-    const lines = txt.split(/\r?\n/);
-    for (const line of lines) {
-      const hs = extractHostsFromRuleLine(line);
-      for (const h of hs) hostBlockSet.add(h);
-    }
-    console.log('[Blocker] loaded', hostBlockSet.size, 'host rules from', BLOCKLIST_PATH);
-  } catch (e) {
-    console.error('[Blocker] failed to load file', e);
-    hostBlockSet = new Set();
-  }
-}
-
-async function buildBlocklistFileFromDBAndSources() {
-  const hostLines = [];
-  try {
-    const rows = await BlockedDomain.findAll({ where: { is_enabled: true } });
-    for (const r of rows) if (r.domain) hostLines.push(`||${r.domain}^   # source:${r.source || 'db'}`);
-  } catch (e) { console.warn('error reading DB blocked domains', e && e.message); }
-
-  const urls = (process.env.BLOCKLIST_URLS || '').split(',').map(s => s.trim()).filter(Boolean);
-  for (const u of urls) {
-    try {
-      const r = await fetch(u, { timeout: 20000 });
-      if (!r.ok) { console.warn('failed fetching list', u, 'status', r.status); continue; }
-      const txt = await r.text();
-      const lines = txt.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
-      hostLines.push(...lines);
-    } catch (e) { console.warn('error fetching list', u, e && e.message); }
-  }
-
-  try { fs.writeFileSync(BLOCKLIST_PATH, hostLines.join('\n'), 'utf8'); console.log('[Blocker] wrote blocklist file with', hostLines.length, 'lines'); }
-  catch (e) { console.error('[Blocker] failed to write blocklist file', e); }
-}
-
-function normalizeHost(input) {
-  if (!input || typeof input !== 'string') return null;
-  try {
-    let h = input.trim();
-    if (h.startsWith('http://') || h.startsWith('https://')) h = new URL(h).hostname;
-    h = h.replace(/^www\./, '').toLowerCase();
-    if (!/^[a-z0-9\.\-]{1,255}$/.test(h)) return null;
-    return h;
-  } catch (e) { return null; }
-}
-
-async function isBlockedUrl(urlStr) {
-  try {
-    const u = new URL(urlStr);
-    const host = u.hostname.replace(/^www\./, '').toLowerCase();
-    const dbExact = await BlockedDomain.findOne({ where: { domain: host, is_enabled: true } });
-    if (dbExact) return true;
-    const parts = host.split('.');
-    for (let i = 0; i <= parts.length - 2; i++) {
-      const candidate = parts.slice(i).join('.');
-      const db = await BlockedDomain.findOne({ where: { domain: candidate, is_enabled: true } });
-      if (db) return true;
-    }
-    if (hostBlockSet.size > 0) {
-      if (hostBlockSet.has(host)) return true;
-      for (let i = 0; i <= parts.length - 2; i++) {
-        const cand = parts.slice(i).join('.');
-        if (hostBlockSet.has(cand)) return true;
+    const u = new URL(url);
+    [...u.searchParams.keys()].forEach(k => {
+      if (k.startsWith("utm_") || k === "fbclid" || k === "gclid") {
+        u.searchParams.delete(k);
       }
-    }
-    return false;
-  } catch (e) { return false; }
-}
-
-async function reloadBlockerFromDB() {
-  await buildBlocklistFileFromDBAndSources();
-  loadBlocklistsFromFile();
-}
-
-// ---------- Auth & helpers ----------
-function signAdminJwt(admin) {
-  return jwt.sign({ sub: admin.id, u: admin.username }, JWT_SECRET, { expiresIn: JWT_EXP });
-}
-
-function requireAdmin(req, res, next) {
-  const token = req.cookies.admin_token || (req.header('authorization') || '').split(' ')[1];
-  if (!token) return res.status(401).json({ error: 'not logged in' });
-  try {
-    const payload = jwt.verify(token, JWT_SECRET);
-    req.admin = payload;
-    return next();
-  } catch (e) { return res.status(401).json({ error: 'invalid token' }); }
-}
-
-async function audit(adminUser, action, detail, ip) {
-  await AdminAudit.create({ admin_user: adminUser || null, action, detail, ip: ip || null }).catch(()=>{});
-}
-
-function requireApiToken(req, res, next) {
-  const token = req.header('x-api-token') || req.query.api_token;
-  if (!token || token !== process.env.API_TOKEN) return res.status(401).json({ error: 'invalid api token' });
-  next();
-}
-
-// ---------- Admin endpoints ----------
-
-app.get('/admin/exists', async (req, res) => {
-  const c = await Admin.count();
-  res.json({ exists: c > 0 });
-});
-
-// First-time setup. Allowed only if no admin exists.
-app.post('/admin/setup', async (req, res) => {
-  try {
-    const cnt = await Admin.count();
-    if (cnt > 0) return res.status(403).json({ error: 'admin exists' });
-    const username = (req.body.username || 'admin').toString();
-    const password = (req.body.password || '').toString();
-    if (!password || password.length < 8) return res.status(400).json({ error: 'password min 8 chars' });
-    const hash = await bcrypt.hash(password, SALT_ROUNDS);
-    const admin = await Admin.create({ username, password_hash: hash });
-    await audit(username, 'initial_setup', 'created initial admin', req.ip);
-    const token = signAdminJwt(admin);
-    // sameSite Strict is OK because admin is served same-origin from /admin
-    res.cookie('admin_token', token, { httpOnly: true, secure: true, sameSite: 'Strict', maxAge: 8 * 3600 * 1000 });
-    res.json({ ok: true });
-  } catch (e) {
-    console.error('setup err', e);
-    res.status(500).json({ error: 'setup failed' });
-  }
-});
-
-app.post('/admin/login', async (req, res) => {
-  try {
-    const username = (req.body.username || '').toString();
-    const password = (req.body.password || '').toString();
-    if (!username || !password) return res.status(400).json({ error: 'username & password required' });
-    const admin = await Admin.findOne({ where: { username } });
-    if (!admin) { await audit(username, 'login_failed', 'no such admin', req.ip); return res.status(401).json({ error: 'invalid' }); }
-    const ok = await bcrypt.compare(password, admin.password_hash);
-    if (!ok) { await audit(username, 'login_failed', 'bad password', req.ip); return res.status(401).json({ error: 'invalid' }); }
-    await admin.update({ last_login: new Date() });
-    const token = signAdminJwt(admin);
-    res.cookie('admin_token', token, { httpOnly: true, secure: true, sameSite: 'Strict', maxAge: 8 * 3600 * 1000 });
-    await audit(admin.username, 'login', 'admin logged in', req.ip);
-    res.json({ ok: true });
-  } catch (e) { console.error('login err', e); res.status(500).json({ error: 'login failed' }); }
-});
-
-app.post('/admin/logout', requireAdmin, async (req, res) => {
-  res.clearCookie('admin_token');
-  await audit(req.admin.u, 'logout', 'admin logged out', req.ip);
-  res.json({ ok: true });
-});
-
-// Stats
-app.get('/admin/stats', requireAdmin, async (req, res) => {
-  try {
-    const blockedCount = await BlockedDomain.count();
-    const historyCount = await History.count();
-    const usersCount = await UserProfile.count();
-    res.json({ blockedCount, historyCount, usersCount });
-  } catch (e) { res.status(500).json({ error: 'failed' }); }
-});
-
-// Domain management
-app.post('/admin/domains', requireAdmin, async (req, res) => {
-  const domain = req.body.domain;
-  if (!domain) return res.status(400).json({ error: 'domain required' });
-  const host = normalizeHost(domain);
-  if (!host) return res.status(400).json({ error: 'invalid domain' });
-  try {
-    await BlockedDomain.upsert({ domain: host, source: req.body.source || 'manual', added_by: req.admin.u, is_enabled: true, added_at: new Date() });
-    await audit(req.admin.u, 'add_domain', host, req.ip);
-    await reloadBlockerFromDB();
-    res.json({ ok: true, domain: host });
-  } catch (e) { console.error('add domain err', e); res.status(500).json({ error: 'add failed' }); }
-});
-
-app.get('/admin/domains', requireAdmin, async (req, res) => {
-  const q = req.query.q || '';
-  const enabled = req.query.enabled;
-  const page = Math.max(1, parseInt(req.query.page || '1'));
-  const limit = Math.min(500, parseInt(req.query.limit || '100'));
-  const where = {};
-  if (q) where.domain = { [Op.like]: `%${q}%` };
-  if (enabled === '1' || enabled === '0') where.is_enabled = enabled === '1';
-  const rows = await BlockedDomain.findAndCountAll({ where, limit, offset: (page - 1) * limit, order: [['domain', 'ASC']] });
-  res.json({ total: rows.count, page, rows: rows.rows });
-});
-
-app.delete('/admin/domains/:id', requireAdmin, async (req, res) => {
-  const id = req.params.id;
-  const r = await BlockedDomain.findByPk(id);
-  if (!r) return res.status(404).json({ error: 'not found' });
-  await r.destroy();
-  await audit(req.admin.u, 'delete_domain', r.domain, req.ip);
-  await reloadBlockerFromDB();
-  res.json({ ok: true });
-});
-
-app.post('/admin/domains/bulk-toggle', requireAdmin, async (req, res) => {
-  const ids = req.body.ids || [];
-  const enable = !!req.body.enable;
-  if (!Array.isArray(ids) || ids.length === 0) return res.status(400).json({ error: 'ids required' });
-  await BlockedDomain.update({ is_enabled: enable }, { where: { id: ids } });
-  await audit(req.admin.u, 'bulk_toggle', `ids:${ids.length} enable:${enable}`, req.ip);
-  await reloadBlockerFromDB();
-  res.json({ ok: true });
-});
-
-app.post('/admin/domains/upload', requireAdmin, upload.single('file'), async (req, res) => {
-  try {
-    if (!req.file) return res.status(400).json({ error: 'file required' });
-    const content = fs.readFileSync(req.file.path, 'utf8');
-    const records = csvParse(content, { relax_column_count: true, skip_empty_lines: true }).map(r => (Array.isArray(r) ? r[0] : r[0]));
-    const results = { imported: 0, skipped: 0, errors: [] };
-    for (const raw of records) {
-      const host = normalizeHost(String(raw || ''));
-      if (!host) { results.skipped++; continue; }
-      try {
-        await BlockedDomain.upsert({ domain: host, source: 'csv', added_by: req.admin.u, is_enabled: true, added_at: new Date() });
-        results.imported++;
-      } catch (e) {
-        results.errors.push({ domain: host, error: e.message });
-      }
-    }
-    fs.unlinkSync(req.file.path);
-    await audit(req.admin.u, 'upload_csv', `imported:${results.imported} skipped:${results.skipped}`, req.ip);
-    await reloadBlockerFromDB();
-    res.json(results);
-  } catch (e) { console.error('csv upload err', e); res.status(500).json({ error: 'upload failed' }); }
-});
-
-app.get('/admin/domains/download', requireAdmin, async (req, res) => {
-  const rows = await BlockedDomain.findAll({ order: [['domain', 'ASC']] });
-  res.setHeader('Content-disposition', 'attachment; filename=blocked_domains.csv');
-  res.setHeader('Content-type', 'text/csv');
-  res.write('domain,source,is_enabled,added_by,added_at\n');
-  for (const r of rows) {
-    res.write(`${r.domain},${r.source||''},${r.is_enabled?1:0},${r.added_by||''},${r.added_at.toISOString()}\n`);
-  }
-  res.end();
-});
-
-app.post('/admin/blocklist/reload', requireAdmin, async (req, res) => {
-  try {
-    await reloadBlockerFromDB();
-    await audit(req.admin.u, 'reload_blocklist', 'manual reload', req.ip);
-    res.json({ ok: true });
-  } catch (e) { console.error('reload err', e); res.status(500).json({ error: 'reload failed' }); }
-});
-
-app.get('/admin/users', requireAdmin, async (req, res) => {
-  const rows = await History.findAll({
-    attributes: ['ip_addr', [sequelize.fn('max', sequelize.col('visitedAt')), 'last_seen']],
-    group: ['ip_addr'],
-    order: [[sequelize.literal('last_seen'), 'DESC']],
-    limit: 200
-  });
-  res.json(rows);
-});
-
-app.get('/admin/audit', requireAdmin, async (req, res) => {
-  const rows = await AdminAudit.findAll({ order: [['created_at', 'DESC']], limit: 500 });
-  res.json(rows);
-});
-
-// ---------- Account endpoints (simple user profile) ----------
-/**
- * Clients SHOULD store the returned userId in localStorage or cookie and send it as header x-user-id
- * - POST /api/account { name } -> creates new profile and returns { userId }
- * - GET /api/account -> returns profile (requires x-user-id header)
- * - PUT /api/account { name } -> updates profile (requires x-user-id)
- * - DELETE /api/account -> deletes profile (requires x-user-id)
- */
-
-app.post('/api/account', async (req, res) => {
-  const name = (req.body.name || '').toString().trim();
-  if (!name) return res.status(400).json({ error: 'name required' });
-  // generate id (random)
-  const id = 'u_' + Math.random().toString(36).slice(2, 12);
-  try {
-    await UserProfile.create({ id, name, created_at: new Date(), updated_at: new Date() });
-    res.json({ ok: true, userId: id, name });
-  } catch (e) { console.error('create profile', e); res.status(500).json({ error: 'create failed' }); }
-});
-
-app.get('/api/account', async (req, res) => {
-  const id = req.header('x-user-id') || req.query.userId;
-  if (!id) return res.status(400).json({ error: 'userId header required' });
-  const p = await UserProfile.findByPk(id);
-  if (!p) return res.status(404).json({ error: 'not found' });
-  res.json({ id: p.id, name: p.name, created_at: p.created_at, updated_at: p.updated_at });
-});
-
-app.put('/api/account', async (req, res) => {
-  const id = req.header('x-user-id') || req.body.userId;
-  if (!id) return res.status(400).json({ error: 'userId required' });
-  const name = (req.body.name || '').toString().trim();
-  if (!name) return res.status(400).json({ error: 'name required' });
-  const p = await UserProfile.findByPk(id);
-  if (!p) return res.status(404).json({ error: 'not found' });
-  p.name = name; p.updated_at = new Date();
-  await p.save();
-  res.json({ ok: true });
-});
-
-app.delete('/api/account', async (req, res) => {
-  const id = req.header('x-user-id') || req.body.userId;
-  if (!id) return res.status(400).json({ error: 'userId required' });
-  await UserProfile.destroy({ where: { id } });
-  await History.destroy({ where: { userId: id } });
-  res.json({ ok: true });
-});
-
-// ---------- Public API endpoints (require API_TOKEN) ----------
-
-app.get('/api/search', requireApiToken, async (req, res) => {
-  const q = req.query.q;
-  if (!q) return res.status(400).json({ error: 'q required' });
-  const key = process.env.GOOGLE_API_KEY;
-  const cx = process.env.GOOGLE_CX;
-  if (!key || !cx) return res.status(500).json({ error: 'search not configured' });
-  const url = `https://www.googleapis.com/customsearch/v1?key=${encodeURIComponent(key)}&cx=${encodeURIComponent(cx)}&q=${encodeURIComponent(q)}`;
-  try {
-    const r = await fetch(url);
-    if (!r.ok) return res.status(502).json({ error: 'search provider failed', status: r.status });
-    const data = await r.json();
-    if (data.items && Array.isArray(data.items)) {
-      const filtered = [];
-      for (const it of data.items) {
-        const blocked = it.link ? await isBlockedUrl(it.link) : false;
-        if (!blocked) filtered.push(it);
-      }
-      data.items = filtered;
-    }
-    if (req.query.incognito !== '1' && data.items && data.items[0]) {
-      await History.create({ userId: req.query.userId || null, url: data.items[0].link, title: data.items[0].title, snippet: data.items[0].snippet || null, visitedAt: new Date(), isIncognito: false, ip_addr: req.ip }).catch(()=>{});
-    }
-    res.json(data);
-  } catch (e) { console.error('search error', e); res.status(500).json({ error: 'search failed' }); }
-});
-
-app.get('/api/proxy', requireApiToken, async (req, res) => {
-  const target = req.query.url;
-  if (!target) return res.status(400).json({ error: 'url required' });
-  try {
-    if (await isBlockedUrl(target)) {
-      await History.create({ userId: req.query.userId || null, url: target, isIncognito: false, ip_addr: req.ip }).catch(()=>{});
-      return res.status(403).json({ blocked: true });
-    }
-    const r = await fetch(target, { headers: { 'User-Agent': 'DeepBrowserBackend/1.0' }, redirect: 'follow' });
-    const ct = r.headers.get('content-type') || '';
-    if (ct.includes('text/html') && req.query.sanitize === '1') {
-      let html = await r.text();
-      const $ = cheerio.load(html);
-      const removals = [];
-      $('script, iframe, link[rel="stylesheet"]').each((i, el) => {
-        const src = $(el).attr('src') || $(el).attr('href') || '';
-        if (src) removals.push({ el, src });
-      });
-      for (const it of removals) {
-        try {
-          const blocked = await isBlockedUrl(it.src);
-          if (blocked) $(it.el).remove();
-        } catch (e) { /* ignore */ }
-      }
-      $('[onclick],[onload],[onerror]').each((i, el) => {
-        $(el).removeAttr('onclick').removeAttr('onload').removeAttr('onerror');
-      });
-      const out = $.html();
-      res.type('text/html').send(out);
-    } else {
-      res.status(r.status);
-      r.body.pipe(res);
-    }
-    if (req.query.incognito !== '1') {
-      await History.create({ userId: req.query.userId || null, url: target, isIncognito: false, ip_addr: req.ip }).catch(()=>{});
-    }
-  } catch (e) { console.error('proxy fetch failed', e); res.status(502).json({ error: 'fetch failed' }); }
-});
-
-app.get('/api/history', requireApiToken, async (req, res) => {
-  const limit = Math.min(200, parseInt(req.query.limit || '50'));
-  const where = {};
-  if (req.query.userId) where.userId = req.query.userId;
-  const rows = await History.findAll({ where, order: [['visitedAt', 'DESC']], limit });
-  res.json(rows);
-});
-app.post('/api/history', requireApiToken, async (req, res) => {
-  const { url, title, incognito } = req.body;
-  if (!url) return res.status(400).json({ error: 'url required' });
-  await History.create({ userId: req.body.userId || null, url, title: title||null, isIncognito: !!incognito, ip_addr: req.ip }).catch(e => console.warn(e));
-  res.json({ ok: true });
-});
-
-// Health + friendly root (index.html served from public/)
-app.get('/health', (req, res) => res.json({ ok: true }));
-app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
-
-// ---------- Initialize DB, blocklists, and start server ----------
-(async function init() {
-  try {
-    await sequelize.authenticate();
-    await Admin.sync();
-    await BlockedDomain.sync();
-    await History.sync();
-    await AdminAudit.sync();
-    await UserProfile.sync();
-    console.log('[DB] SQLite connected & models synced at', SQLITE_FILE);
-
-    // build & load blocklist after tables exist
-    try { await buildBlocklistFileFromDBAndSources(); loadBlocklistsFromFile(); console.log('[Blocker] initial blocklist built and loaded'); }
-    catch (err) { console.warn('[Blocker] initial build/load failed', err && err.message); }
-
-    app.listen(PORT, () => {
-      console.log(`server listening on ${PORT}`);
-      console.log('==> Your service is live');
     });
-
-  } catch (e) {
-    console.error('DB init error', e);
-    process.exit(1);
+    return u.toString();
+  } catch {
+    return url;
   }
-})();
+}
+
+// -------------------------------------------
+// AUTO-CREATE USER BY IP
+// -------------------------------------------
+app.get("/user/init", async (req, res) => {
+  const ip = req.headers["x-forwarded-for"] || req.ip;
+
+  const [rows] = await db.query("SELECT * FROM users WHERE ip = ? LIMIT 1", [ip]);
+  if (rows.length) return res.json({ user: rows[0] });
+
+  const [insert] = await db.query("INSERT INTO users (ip) VALUES (?)", [ip]);
+  res.json({ user: { id: insert.insertId, ip } });
+});
+
+// -------------------------------------------
+// SEARCH USING GOOGLE API (NO TOKEN NEEDED)
+// -------------------------------------------
+app.get("/search", async (req, res) => {
+  const q = req.query.q;
+  if (!q) return res.status(400).json({ error: "Missing query" });
+
+  try {
+    const googleURL =
+      `https://www.googleapis.com/customsearch/v1?key=${process.env.GOOGLE_API_KEY}&cx=${process.env.GOOGLE_CX}&q=` +
+      encodeURIComponent(q);
+
+    const result = await axios.get(googleURL);
+    const cleaned = (result.data.items || []).map(i => ({
+      title: i.title,
+      link: cleanUrl(i.link),
+      snippet: i.snippet
+    }));
+
+    res.json({ results: cleaned });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Google API error" });
+  }
+});
+
+// -------------------------------------------
+// SAVE HISTORY
+// -------------------------------------------
+app.post("/history/add", async (req, res) => {
+  const { userId, url, title } = req.body;
+  if (!userId || !url) return res.status(400).json({ error: "Missing fields" });
+
+  await db.query(
+    "INSERT INTO history (user_id, url, title) VALUES (?, ?, ?)",
+    [userId, url, title]
+  );
+
+  res.json({ ok: true });
+});
+
+// -------------------------------------------
+// GET USER HISTORY
+// -------------------------------------------
+app.get("/history/user/:id", async (req, res) => {
+  const id = req.params.id;
+  const [rows] = await db.query(
+    "SELECT * FROM history WHERE user_id = ? ORDER BY timestamp DESC",
+    [id]
+  );
+  res.json(rows);
+});
+
+// -------------------------------------------
+// ADMIN AUTH
+// -------------------------------------------
+app.post("/admin/auth", (req, res) => {
+  const { password } = req.body;
+  if (password === process.env.ADMIN_PASSWORD) {
+    return res.json({ ok: true });
+  }
+  res.status(401).json({ ok: false });
+});
+
+// -------------------------------------------
+// ADMIN GET ALL USERS
+// -------------------------------------------
+app.get("/admin/users", async (req, res) => {
+  if (req.query.password !== process.env.ADMIN_PASSWORD)
+    return res.status(401).json({ ok: false });
+
+  const [rows] = await db.query("SELECT * FROM users ORDER BY id DESC");
+  res.json(rows);
+});
+
+// -------------------------------------------
+// ADMIN GET FULL HISTORY
+// -------------------------------------------
+app.get("/admin/history", async (req, res) => {
+  if (req.query.password !== process.env.ADMIN_PASSWORD)
+    return res.status(401).json({ ok: false });
+
+  const [rows] = await db.query(`
+    SELECT h.*, u.ip
+    FROM history h
+    LEFT JOIN users u ON h.user_id = u.id
+    ORDER BY h.timestamp DESC
+  `);
+  res.json(rows);
+});
+
+// -------------------------------------------
+app.get("/", (req, res) => {
+  res.send("Deep Browser Backend Running");
+});
+
+// -------------------------------------------
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log("Server running on " + PORT));
