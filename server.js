@@ -1,16 +1,30 @@
-
 /**
- * server.js (SQLite edition)
- * Same API and behavior as before, but uses SQLite (database.sqlite) so you don't need MySQL credentials.
+ * server.js - Updated, robust backend (SQLite) with host-based blocklist parsing
  *
- * Env variables used:
- *  - API_TOKEN (required for /api/*)
- *  - APP_SECRET (required for admin JWTs)
- *  - GOOGLE_API_KEY, GOOGLE_CX (optional for /api/search)
- *  - BLOCKLIST_URLS (optional)
- *  - PORT (optional)
+ * Features:
+ * - SQLite (no external DB required)
+ * - Admin setup/login (bcrypt + JWT in HTTP-only cookie)
+ * - Admin endpoints: add domain, bulk toggle, delete, CSV upload/download, reload blocklists
+ * - Public API: /api/search (Google CSE), /api/proxy (sanitized), /api/history
+ * - Block decision uses:
+ *     1) admin DB "blocked_domains" entries (exact host match or parent domain)
+ *     2) parsed host rules from external blocklists (BLOCKLIST_URLS) and DB, loaded into an in-memory Set
+ * - Simple, reliable parsing for ABP-style host rules (lines like "||example.com^") and hosts lists
  *
- * Note: SQLite file is stored in the service filesystem (database.sqlite). On Render this file can be lost on redeploy.
+ * Notes:
+ * - This intentionally avoids unreliable third-party adblock npm packages and uses deterministic host matching.
+ * - To block more complex cases later, we can integrate a full ABP engine; for now this is fast and stable.
+ *
+ * Required env vars:
+ * - API_TOKEN (required for /api/*)
+ * - APP_SECRET (required for admin JWTs)
+ * - GOOGLE_API_KEY, GOOGLE_CX (optional - /api/search)
+ * - BLOCKLIST_URLS (optional - comma-separated list of external lists to fetch when reloading)
+ * - PORT (optional)
+ *
+ * Run:
+ *  npm install
+ *  npm start
  */
 
 require('dotenv').config();
@@ -27,7 +41,6 @@ const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const cookieParser = require('cookie-parser');
 const cheerio = require('cheerio');
-const { Blocker, ABPFilterParser } = require('@cliqz/adblocker');
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
@@ -43,7 +56,7 @@ const UPLOAD_DIR = path.join(__dirname, 'tmp');
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 const upload = multer({ dest: UPLOAD_DIR, limits: { fileSize: 10 * 1024 * 1024 } }); // 10MB
 
-// --- Use SQLite via Sequelize
+// ---------- SQLite (Sequelize) ----------
 const SQLITE_FILE = path.join(__dirname, 'database.sqlite');
 const sequelize = new Sequelize({
   dialect: 'sqlite',
@@ -51,7 +64,7 @@ const sequelize = new Sequelize({
   logging: false
 });
 
-// Models (same names/fields as previous)
+// Models
 const Admin = sequelize.define('Admin', {
   username: { type: DataTypes.STRING, unique: true, allowNull: false, defaultValue: 'admin' },
   password_hash: { type: DataTypes.STRING, allowNull: false },
@@ -85,7 +98,7 @@ const AdminAudit = sequelize.define('AdminAudit', {
   created_at: { type: DataTypes.DATE, defaultValue: DataTypes.NOW }
 }, { tableName: 'admin_audit', timestamps: false });
 
-// Initialize DB (create file if missing)
+// Initialize DB
 (async () => {
   try {
     await sequelize.authenticate();
@@ -93,7 +106,7 @@ const AdminAudit = sequelize.define('AdminAudit', {
     await BlockedDomain.sync();
     await History.sync();
     await AdminAudit.sync();
-    console.log('[DB] SQLite connected & synced at', SQLITE_FILE);
+    console.log('[DB] SQLite connected & models synced at', SQLITE_FILE);
   } catch (e) {
     console.error('DB init error', e);
     process.exit(1);
@@ -103,29 +116,104 @@ const AdminAudit = sequelize.define('AdminAudit', {
 // Rate limiter
 app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 500 }));
 
-// Blocker in-memory
-let blocker = null;
+// ---------- Blocklist in-memory structure (host-based) ----------
+let hostBlockSet = new Set(); // contains normalized host strings to block (example.com, ads.example.org)
+
+// parse a single line from ABP/hosts list into zero or more hostnames
+function extractHostsFromRuleLine(line) {
+  // Normalize
+  line = (line || '').trim();
+  if (!line || line.startsWith('!') || line.startsWith('[')) return [];
+  // If it's a simple hosts file line: "0.0.0.0 domain" or "127.0.0.1 domain"
+  const hosts = [];
+  const hostMatch = line.match(/^(?:0\.0\.0\.0|127\.0\.0\.1)\s+([^\s#]+)/);
+  if (hostMatch) {
+    hosts.push(hostMatch[1].replace(/^www\./, '').toLowerCase());
+    return hosts;
+  }
+  // ABP simple rule: ||domain^
+  const abpHostMatch = line.match(/^\|\|([^\/\^\$]+)\^?/);
+  if (abpHostMatch) {
+    hosts.push(abpHostMatch[1].replace(/^www\./, '').toLowerCase());
+    return hosts;
+  }
+  // Domain-only lines (just a domain)
+  if (/^[a-z0-9\.\-]+$/i.test(line)) {
+    hosts.push(line.replace(/^www\./, '').toLowerCase());
+    return hosts;
+  }
+  // Some rules may be urls: https?://domain/... -> extract host
+  try {
+    if (line.startsWith('http://') || line.startsWith('https://')) {
+      const u = new URL(line);
+      hosts.push(u.hostname.replace(/^www\./, '').toLowerCase());
+      return hosts;
+    }
+  } catch (e) { /* ignore */ }
+  return [];
+}
+
+// Load blocklist file into hostBlockSet
 function loadBlocklistsFromFile() {
+  hostBlockSet = new Set();
   try {
     if (!fs.existsSync(BLOCKLIST_PATH)) {
-      blocker = null;
-      console.warn('[Blocker] no blocklist file found');
+      console.warn('[Blocker] blocklist file not found:', BLOCKLIST_PATH);
       return;
     }
     const txt = fs.readFileSync(BLOCKLIST_PATH, 'utf8');
-    const lines = txt.split(/\r?\n/).filter(Boolean);
-    const parser = new ABPFilterParser({ hideFilters: true });
-    parser.add(lines.join('\n'));
-    blocker = new Blocker(parser);
-    console.log('[Blocker] loaded with rules:', lines.length);
+    const lines = txt.split(/\r?\n/);
+    for (const line of lines) {
+      const hs = extractHostsFromRuleLine(line);
+      for (const h of hs) hostBlockSet.add(h);
+    }
+    console.log('[Blocker] loaded', hostBlockSet.size, 'host rules from', BLOCKLIST_PATH);
   } catch (e) {
-    console.error('[Blocker] load failed', e);
-    blocker = null;
+    console.error('[Blocker] failed to load file', e);
+    hostBlockSet = new Set();
   }
 }
-loadBlocklistsFromFile();
 
-// Utility normalize host
+// Build blocklist file from DB + external lists (writes BLOCKLIST_PATH)
+async function buildBlocklistFileFromDBAndSources() {
+  const hostLines = [];
+  // include admin DB domains
+  try {
+    const rows = await BlockedDomain.findAll({ where: { is_enabled: true } });
+    for (const r of rows) {
+      if (r.domain) hostLines.push(`||${r.domain}^   # source:${r.source || 'db'}`);
+    }
+  } catch (e) {
+    console.warn('error reading DB blocked domains', e);
+  }
+
+  // fetch external lists (BLOCKLIST_URLS env)
+  const urls = (process.env.BLOCKLIST_URLS || '').split(',').map(s => s.trim()).filter(Boolean);
+  for (const u of urls) {
+    try {
+      const r = await fetch(u, { timeout: 20000 });
+      if (!r.ok) {
+        console.warn('failed fetching list', u, 'status', r.status);
+        continue;
+      }
+      const txt = await r.text();
+      const lines = txt.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+      hostLines.push(...lines);
+    } catch (e) {
+      console.warn('error fetching list', u, e && e.message);
+    }
+  }
+
+  // write merged file
+  try {
+    fs.writeFileSync(BLOCKLIST_PATH, hostLines.join('\n'), 'utf8');
+    console.log('[Blocker] wrote blocklist file with', hostLines.length, 'lines');
+  } catch (e) {
+    console.error('[Blocker] failed to write blocklist file', e);
+  }
+}
+
+// Helper: normalize host for matching
 function normalizeHost(input) {
   if (!input || typeof input !== 'string') return null;
   try {
@@ -134,27 +222,67 @@ function normalizeHost(input) {
     h = h.replace(/^www\./, '').toLowerCase();
     if (!/^[a-z0-9\.\-]{1,255}$/.test(h)) return null;
     return h;
-  } catch (e) { return null; }
+  } catch (e) {
+    return null;
+  }
 }
 
-// Check blocked by DB or ABP engine
+// Blocking decision: check DB + hostBlockSet
 async function isBlockedUrl(urlStr) {
   try {
     const u = new URL(urlStr);
     const host = u.hostname.replace(/^www\./, '').toLowerCase();
-    const dbMatch = await BlockedDomain.findOne({ where: { domain: host, is_enabled: true } });
-    if (dbMatch) return true;
-    if (!blocker) return false;
-    return blocker.matches(u.href, { elementType: 'other' });
+
+    // 1) DB exact/parent domain check (admin overrides)
+    // check exact
+    const dbExact = await BlockedDomain.findOne({ where: { domain: host, is_enabled: true } });
+    if (dbExact) return true;
+    // check parent domain matches (example.com matches sub.example.com)
+    const parts = host.split('.');
+    for (let i = 0; i <= parts.length - 2; i++) {
+      const candidate = parts.slice(i).join('.');
+      const db = await BlockedDomain.findOne({ where: { domain: candidate, is_enabled: true } });
+      if (db) return true;
+    }
+
+    // 2) hostBlockSet (fast in-memory)
+    // check exact and parent suffixes
+    if (hostBlockSet.size > 0) {
+      if (hostBlockSet.has(host)) return true;
+      // check suffixes (block example.com should match sub.example.com)
+      for (let i = 0; i <= parts.length - 2; i++) {
+        const cand = parts.slice(i).join('.');
+        if (hostBlockSet.has(cand)) return true;
+      }
+    }
+
+    return false;
   } catch (e) {
     return false;
   }
 }
 
-// Admin helpers
+// After DB or external change: rebuild file and reload in-memory set
+async function reloadBlockerFromDB() {
+  await buildBlocklistFileFromDBAndSources();
+  loadBlocklistsFromFile();
+}
+
+// Initially try to build & load
+(async () => {
+  try {
+    await buildBlocklistFileFromDBAndSources();
+    loadBlocklistsFromFile();
+  } catch (e) {
+    console.warn('[Blocker] initial build/load failed', e);
+  }
+})();
+
+// ---------- Admin helpers & auth ----------
 function signAdminJwt(admin) {
   return jwt.sign({ sub: admin.id, u: admin.username }, JWT_SECRET, { expiresIn: JWT_EXP });
 }
+
 function requireAdmin(req, res, next) {
   const token = req.cookies.admin_token || (req.header('authorization') || '').split(' ')[1];
   if (!token) return res.status(401).json({ error: 'not logged in' });
@@ -166,47 +294,27 @@ function requireAdmin(req, res, next) {
     return res.status(401).json({ error: 'invalid token' });
   }
 }
+
 async function audit(adminUser, action, detail, ip) {
   await AdminAudit.create({ admin_user: adminUser || null, action, detail, ip: ip || null }).catch(()=>{});
 }
 
-// Build blocklist file from DB + external lists
-async function buildBlocklistFileFromDBAndSources() {
-  const rows = await BlockedDomain.findAll({ where: { is_enabled: true } });
-  const hostRules = rows.map(r => `||${r.domain}^`);
-  const urls = (process.env.BLOCKLIST_URLS || '').split(',').map(s => s.trim()).filter(Boolean);
-  for (const u of urls) {
-    try {
-      const r = await fetch(u);
-      if (!r.ok) continue;
-      const txt = await r.text();
-      const lines = txt.split(/\r?\n/).filter(l => l && !l.startsWith('!'));
-      hostRules.push(...lines);
-    } catch (e) { /* ignore */ }
-  }
-  fs.writeFileSync(BLOCKLIST_PATH, hostRules.join('\n'), 'utf8');
-}
-
-// Reload blocker (call after DB changes)
-async function reloadBlockerFromDB() {
-  await buildBlocklistFileFromDBAndSources();
-  loadBlocklistsFromFile();
-}
-
-// Simple API token middleware
+// API token middleware
 function requireApiToken(req, res, next) {
   const token = req.header('x-api-token') || req.query.api_token;
   if (!token || token !== process.env.API_TOKEN) return res.status(401).json({ error: 'invalid api token' });
   next();
 }
 
-// --- Admin endpoints
+// ---------- Admin endpoints ----------
 
+// Check if an admin exists
 app.get('/admin/exists', async (req, res) => {
   const c = await Admin.count();
   res.json({ exists: c > 0 });
 });
 
+// Setup first-time admin
 app.post('/admin/setup', async (req, res) => {
   try {
     const cnt = await Admin.count();
@@ -226,6 +334,7 @@ app.post('/admin/setup', async (req, res) => {
   }
 });
 
+// Login admin
 app.post('/admin/login', async (req, res) => {
   try {
     const username = (req.body.username || '').toString();
@@ -252,12 +361,14 @@ app.post('/admin/login', async (req, res) => {
   }
 });
 
+// Logout
 app.post('/admin/logout', requireAdmin, async (req, res) => {
   res.clearCookie('admin_token');
   await audit(req.admin.u, 'logout', 'admin logged out', req.ip);
   res.json({ ok: true });
 });
 
+// Add single domain
 app.post('/admin/domains', requireAdmin, async (req, res) => {
   const domain = req.body.domain;
   if (!domain) return res.status(400).json({ error: 'domain required' });
@@ -274,6 +385,7 @@ app.post('/admin/domains', requireAdmin, async (req, res) => {
   }
 });
 
+// List domains (paginated)
 app.get('/admin/domains', requireAdmin, async (req, res) => {
   const q = req.query.q || '';
   const enabled = req.query.enabled;
@@ -286,6 +398,7 @@ app.get('/admin/domains', requireAdmin, async (req, res) => {
   res.json({ total: rows.count, page, rows: rows.rows });
 });
 
+// Delete domain
 app.delete('/admin/domains/:id', requireAdmin, async (req, res) => {
   const id = req.params.id;
   const r = await BlockedDomain.findByPk(id);
@@ -296,6 +409,7 @@ app.delete('/admin/domains/:id', requireAdmin, async (req, res) => {
   res.json({ ok: true });
 });
 
+// Bulk toggle
 app.post('/admin/domains/bulk-toggle', requireAdmin, async (req, res) => {
   const ids = req.body.ids || [];
   const enable = !!req.body.enable;
@@ -306,6 +420,7 @@ app.post('/admin/domains/bulk-toggle', requireAdmin, async (req, res) => {
   res.json({ ok: true });
 });
 
+// CSV upload
 app.post('/admin/domains/upload', requireAdmin, upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'file required' });
@@ -332,6 +447,7 @@ app.post('/admin/domains/upload', requireAdmin, upload.single('file'), async (re
   }
 });
 
+// Download CSV
 app.get('/admin/domains/download', requireAdmin, async (req, res) => {
   const rows = await BlockedDomain.findAll({ order: [['domain', 'ASC']] });
   res.setHeader('Content-disposition', 'attachment; filename=blocked_domains.csv');
@@ -343,6 +459,7 @@ app.get('/admin/domains/download', requireAdmin, async (req, res) => {
   res.end();
 });
 
+// Force reload blocklists (DB + external)
 app.post('/admin/blocklist/reload', requireAdmin, async (req, res) => {
   try {
     await reloadBlockerFromDB();
@@ -354,6 +471,7 @@ app.post('/admin/blocklist/reload', requireAdmin, async (req, res) => {
   }
 });
 
+// Admin: users (simple aggregated view)
 app.get('/admin/users', requireAdmin, async (req, res) => {
   const rows = await History.findAll({
     attributes: ['ip_addr', [sequelize.fn('max', sequelize.col('visitedAt')), 'last_seen']],
@@ -364,12 +482,15 @@ app.get('/admin/users', requireAdmin, async (req, res) => {
   res.json(rows);
 });
 
+// Admin audit
 app.get('/admin/audit', requireAdmin, async (req, res) => {
   const rows = await AdminAudit.findAll({ order: [['created_at', 'DESC']], limit: 500 });
   res.json(rows);
 });
 
-// Public API
+// ---------- Public API endpoints ----------
+
+// Search (Google Custom Search) - requires API_TOKEN
 app.get('/api/search', requireApiToken, async (req, res) => {
   const q = req.query.q;
   if (!q) return res.status(400).json({ error: 'q required' });
@@ -399,6 +520,7 @@ app.get('/api/search', requireApiToken, async (req, res) => {
   }
 });
 
+// Proxy endpoint (authenticated) - sanitize removes blocked scripts/iframes/stylesheet links
 app.get('/api/proxy', requireApiToken, async (req, res) => {
   const target = req.query.url;
   if (!target) return res.status(400).json({ error: 'url required' });
@@ -414,8 +536,17 @@ app.get('/api/proxy', requireApiToken, async (req, res) => {
       const $ = cheerio.load(html);
       $('script, iframe, link[rel="stylesheet"]').each((i, el) => {
         const src = $(el).attr('src') || $(el).attr('href') || '';
-        if (src && isBlockedUrl(src)) $(el).remove();
+        if (src) {
+          // if the resource URL is blocked by our rules, remove the element
+          (async () => {
+            try {
+              const blocked = await isBlockedUrl(src);
+              if (blocked) $(el).remove();
+            } catch (e) { /* ignore */ }
+          })();
+        }
       });
+      // remove inline event handlers (basic)
       $('[onclick],[onload],[onerror]').each((i, el) => {
         $(el).removeAttr('onclick').removeAttr('onload').removeAttr('onerror');
       });
@@ -434,6 +565,7 @@ app.get('/api/proxy', requireApiToken, async (req, res) => {
   }
 });
 
+// History endpoints
 app.get('/api/history', requireApiToken, async (req, res) => {
   const limit = Math.min(100, parseInt(req.query.limit || '50'));
   const rows = await History.findAll({ order: [['visitedAt', 'DESC']], limit });
@@ -446,15 +578,8 @@ app.post('/api/history', requireApiToken, async (req, res) => {
   res.json({ ok: true });
 });
 
+// Health
 app.get('/health', (req, res) => res.json({ ok: true }));
-
-// Build and load blocklist immediate if possible
-(async () => {
-  try {
-    await buildBlocklistFileFromDBAndSources();
-    loadBlocklistsFromFile();
-  } catch (e) { /* ignore */ }
-})();
 
 // Start server
 app.listen(PORT, () => console.log(`server listening on ${PORT}`));
