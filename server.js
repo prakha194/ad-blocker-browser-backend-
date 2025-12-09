@@ -1,27 +1,27 @@
 /**
- * server.js - Final corrected backend (SQLite)
+ * server.js - Full backend for Deep Browser (SQLite)
  *
- * Paste this file into your repo, ensure package.json matches the dependencies:
- * - bcrypt, cheerio, cookie-parser, csv-parse, dotenv, express, express-rate-limit,
- *   helmet, jsonwebtoken, multer, node-fetch, sequelize, sqlite3
+ * - Serves static frontend from ./public (index.html + app.js)
+ * - Serves admin UI from ./public/admin/admin.html (same origin -> cookies work)
+ * - Admin setup/login/logout (first-time setup creates permanent password)
+ * - Blocklist management: add/delete/toggle/upload/download/reload
+ * - Proxy (sanitize), Search (Google CSE), History, simple Accounts API
+ * - Uses SQLite (database.sqlite), no external DB required for now
  *
- * Then: npm install && npm start
+ * Env vars:
+ * - API_TOKEN (required for /api/* calls)
+ * - APP_SECRET (JWT secret for admin sessions)
+ * - GOOGLE_API_KEY, GOOGLE_CX (optional for /api/search)
+ * - BLOCKLIST_URLS (comma-separated list of external lists to merge)
+ * - PORT (optional)
  *
- * Env variables:
- *  - API_TOKEN (required for /api/*)
- *  - APP_SECRET (required for admin JWTs)
- *  - GOOGLE_API_KEY, GOOGLE_CX (optional for /api/search)
- *  - BLOCKLIST_URLS (optional)
- *  - PORT (optional)
- *
- * Notes:
- *  - Server listens only after DB sync + blocklist load to avoid "no such table" errors.
- *  - Root path "/" is not served; use /health to check liveness.
+ * Deployment: npm install && npm start
  */
 
 require('dotenv').config();
-const fs = require('fs');
+
 const path = require('path');
+const fs = require('fs');
 const express = require('express');
 const helmet = require('helmet');
 const fetch = require('node-fetch');
@@ -35,9 +35,13 @@ const cookieParser = require('cookie-parser');
 const cheerio = require('cheerio');
 
 const app = express();
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({ limit: '2mb' }));
 app.use(helmet());
 app.use(cookieParser());
+
+// serve static frontend & admin from same origin
+app.use(express.static(path.join(__dirname, 'public')));
+app.use('/admin', express.static(path.join(__dirname, 'public', 'admin')));
 
 const PORT = process.env.PORT || 10000;
 const JWT_SECRET = process.env.APP_SECRET || 'change-this-secret';
@@ -46,7 +50,7 @@ const SALT_ROUNDS = 12;
 const BLOCKLIST_PATH = path.join(__dirname, 'blocklists.txt');
 const UPLOAD_DIR = path.join(__dirname, 'tmp');
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-const upload = multer({ dest: UPLOAD_DIR, limits: { fileSize: 10 * 1024 * 1024 } }); // 10MB
+const upload = multer({ dest: UPLOAD_DIR, limits: { fileSize: 20 * 1024 * 1024 } }); // 20MB
 
 // ---------- SQLite (Sequelize) ----------
 const SQLITE_FILE = path.join(__dirname, 'database.sqlite');
@@ -73,7 +77,7 @@ const BlockedDomain = sequelize.define('BlockedDomain', {
 }, { tableName: 'blocked_domains', timestamps: false });
 
 const History = sequelize.define('History', {
-  userId: { type: DataTypes.BIGINT, allowNull: true },
+  userId: { type: DataTypes.STRING(128), allowNull: true },
   url: { type: DataTypes.TEXT, allowNull: false },
   title: DataTypes.STRING(1024),
   snippet: DataTypes.TEXT,
@@ -90,57 +94,36 @@ const AdminAudit = sequelize.define('AdminAudit', {
   created_at: { type: DataTypes.DATE, defaultValue: DataTypes.NOW }
 }, { tableName: 'admin_audit', timestamps: false });
 
+const UserProfile = sequelize.define('UserProfile', {
+  id: { type: DataTypes.STRING(128), primaryKey: true }, // client-generated uuid or random
+  name: DataTypes.STRING(200),
+  created_at: { type: DataTypes.DATE, defaultValue: DataTypes.NOW },
+  updated_at: DataTypes.DATE
+}, { tableName: 'user_profiles', timestamps: false });
+
 // ---------- Rate limiter ----------
-app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 500 }));
+app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 1000 }));
 
 // ---------- Host-based blocklist ----------
 let hostBlockSet = new Set();
 
-// Parse various line types to extract hosts
 function extractHostsFromRuleLine(line) {
   line = (line || '').trim();
   if (!line || line.startsWith('!') || line.startsWith('[') || line.startsWith('@')) return [];
   const hosts = [];
-
-  // hosts file style: "0.0.0.0 domain" or "127.0.0.1 domain"
   const hostMatch = line.match(/^(?:0\.0\.0\.0|127\.0\.0\.1)\s+([^\s#]+)/);
-  if (hostMatch) {
-    hosts.push(hostMatch[1].replace(/^www\./, '').toLowerCase());
-    return hosts;
-  }
-
-  // ABP basic host rule: ||domain^
+  if (hostMatch) { hosts.push(hostMatch[1].replace(/^www\./, '').toLowerCase()); return hosts; }
   const abpHostMatch = line.match(/^\|\|([^\/\^\$]+)\^?/);
-  if (abpHostMatch) {
-    hosts.push(abpHostMatch[1].replace(/^www\./, '').toLowerCase());
-    return hosts;
-  }
-
-  // direct domain line
-  if (/^[a-z0-9\.\-]+$/i.test(line)) {
-    hosts.push(line.replace(/^www\./, '').toLowerCase());
-    return hosts;
-  }
-
-  // full URL
-  try {
-    if (line.startsWith('http://') || line.startsWith('https://')) {
-      const u = new URL(line);
-      hosts.push(u.hostname.replace(/^www\./, '').toLowerCase());
-      return hosts;
-    }
-  } catch (e) { /* ignore */ }
-
+  if (abpHostMatch) { hosts.push(abpHostMatch[1].replace(/^www\./, '').toLowerCase()); return hosts; }
+  if (/^[a-z0-9\.\-]+$/i.test(line)) { hosts.push(line.replace(/^www\./, '').toLowerCase()); return hosts; }
+  try { if (line.startsWith('http://') || line.startsWith('https://')) { const u = new URL(line); hosts.push(u.hostname.replace(/^www\./, '').toLowerCase()); return hosts; } } catch (e) {}
   return hosts;
 }
 
 function loadBlocklistsFromFile() {
   hostBlockSet = new Set();
   try {
-    if (!fs.existsSync(BLOCKLIST_PATH)) {
-      console.warn('[Blocker] blocklist file not found:', BLOCKLIST_PATH);
-      return;
-    }
+    if (!fs.existsSync(BLOCKLIST_PATH)) return;
     const txt = fs.readFileSync(BLOCKLIST_PATH, 'utf8');
     const lines = txt.split(/\r?\n/);
     for (const line of lines) {
@@ -154,46 +137,28 @@ function loadBlocklistsFromFile() {
   }
 }
 
-// Compose blocklist file from DB + external sources
 async function buildBlocklistFileFromDBAndSources() {
   const hostLines = [];
-
-  // Add DB-managed domains
   try {
     const rows = await BlockedDomain.findAll({ where: { is_enabled: true } });
-    for (const r of rows) {
-      if (r.domain) hostLines.push(`||${r.domain}^   # source:${r.source || 'db'}`);
-    }
-  } catch (e) {
-    console.warn('error reading DB blocked domains', e && e.message);
-  }
+    for (const r of rows) if (r.domain) hostLines.push(`||${r.domain}^   # source:${r.source || 'db'}`);
+  } catch (e) { console.warn('error reading DB blocked domains', e && e.message); }
 
-  // Fetch external lists
   const urls = (process.env.BLOCKLIST_URLS || '').split(',').map(s => s.trim()).filter(Boolean);
   for (const u of urls) {
     try {
       const r = await fetch(u, { timeout: 20000 });
-      if (!r.ok) {
-        console.warn('failed fetching list', u, 'status', r.status);
-        continue;
-      }
+      if (!r.ok) { console.warn('failed fetching list', u, 'status', r.status); continue; }
       const txt = await r.text();
       const lines = txt.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
       hostLines.push(...lines);
-    } catch (e) {
-      console.warn('error fetching list', u, e && e.message);
-    }
+    } catch (e) { console.warn('error fetching list', u, e && e.message); }
   }
 
-  try {
-    fs.writeFileSync(BLOCKLIST_PATH, hostLines.join('\n'), 'utf8');
-    console.log('[Blocker] wrote blocklist file with', hostLines.length, 'lines');
-  } catch (e) {
-    console.error('[Blocker] failed to write blocklist file', e);
-  }
+  try { fs.writeFileSync(BLOCKLIST_PATH, hostLines.join('\n'), 'utf8'); console.log('[Blocker] wrote blocklist file with', hostLines.length, 'lines'); }
+  catch (e) { console.error('[Blocker] failed to write blocklist file', e); }
 }
 
-// Normalize host helper
 function normalizeHost(input) {
   if (!input || typeof input !== 'string') return null;
   try {
@@ -202,27 +167,21 @@ function normalizeHost(input) {
     h = h.replace(/^www\./, '').toLowerCase();
     if (!/^[a-z0-9\.\-]{1,255}$/.test(h)) return null;
     return h;
-  } catch (e) {
-    return null;
-  }
+  } catch (e) { return null; }
 }
 
-// Blocking decision: DB override -> hostBlockSet (check suffixes)
 async function isBlockedUrl(urlStr) {
   try {
     const u = new URL(urlStr);
     const host = u.hostname.replace(/^www\./, '').toLowerCase();
-    // DB exact match
     const dbExact = await BlockedDomain.findOne({ where: { domain: host, is_enabled: true } });
     if (dbExact) return true;
-    // DB parent domain match
     const parts = host.split('.');
     for (let i = 0; i <= parts.length - 2; i++) {
       const candidate = parts.slice(i).join('.');
       const db = await BlockedDomain.findOne({ where: { domain: candidate, is_enabled: true } });
       if (db) return true;
     }
-    // In-memory set
     if (hostBlockSet.size > 0) {
       if (hostBlockSet.has(host)) return true;
       for (let i = 0; i <= parts.length - 2; i++) {
@@ -231,12 +190,9 @@ async function isBlockedUrl(urlStr) {
       }
     }
     return false;
-  } catch (e) {
-    return false;
-  }
+  } catch (e) { return false; }
 }
 
-// Rebuild file + reload in-memory set
 async function reloadBlockerFromDB() {
   await buildBlocklistFileFromDBAndSources();
   loadBlocklistsFromFile();
@@ -254,9 +210,7 @@ function requireAdmin(req, res, next) {
     const payload = jwt.verify(token, JWT_SECRET);
     req.admin = payload;
     return next();
-  } catch (e) {
-    return res.status(401).json({ error: 'invalid token' });
-  }
+  } catch (e) { return res.status(401).json({ error: 'invalid token' }); }
 }
 
 async function audit(adminUser, action, detail, ip) {
@@ -269,13 +223,14 @@ function requireApiToken(req, res, next) {
   next();
 }
 
-// ---------- Admin routes ----------
+// ---------- Admin endpoints ----------
 
 app.get('/admin/exists', async (req, res) => {
   const c = await Admin.count();
   res.json({ exists: c > 0 });
 });
 
+// First-time setup. Allowed only if no admin exists.
 app.post('/admin/setup', async (req, res) => {
   try {
     const cnt = await Admin.count();
@@ -287,6 +242,7 @@ app.post('/admin/setup', async (req, res) => {
     const admin = await Admin.create({ username, password_hash: hash });
     await audit(username, 'initial_setup', 'created initial admin', req.ip);
     const token = signAdminJwt(admin);
+    // sameSite Strict is OK because admin is served same-origin from /admin
     res.cookie('admin_token', token, { httpOnly: true, secure: true, sameSite: 'Strict', maxAge: 8 * 3600 * 1000 });
     res.json({ ok: true });
   } catch (e) {
@@ -301,24 +257,15 @@ app.post('/admin/login', async (req, res) => {
     const password = (req.body.password || '').toString();
     if (!username || !password) return res.status(400).json({ error: 'username & password required' });
     const admin = await Admin.findOne({ where: { username } });
-    if (!admin) {
-      await audit(username, 'login_failed', 'no such admin', req.ip);
-      return res.status(401).json({ error: 'invalid' });
-    }
+    if (!admin) { await audit(username, 'login_failed', 'no such admin', req.ip); return res.status(401).json({ error: 'invalid' }); }
     const ok = await bcrypt.compare(password, admin.password_hash);
-    if (!ok) {
-      await audit(username, 'login_failed', 'bad password', req.ip);
-      return res.status(401).json({ error: 'invalid' });
-    }
+    if (!ok) { await audit(username, 'login_failed', 'bad password', req.ip); return res.status(401).json({ error: 'invalid' }); }
     await admin.update({ last_login: new Date() });
     const token = signAdminJwt(admin);
     res.cookie('admin_token', token, { httpOnly: true, secure: true, sameSite: 'Strict', maxAge: 8 * 3600 * 1000 });
     await audit(admin.username, 'login', 'admin logged in', req.ip);
     res.json({ ok: true });
-  } catch (e) {
-    console.error('login err', e);
-    res.status(500).json({ error: 'login failed' });
-  }
+  } catch (e) { console.error('login err', e); res.status(500).json({ error: 'login failed' }); }
 });
 
 app.post('/admin/logout', requireAdmin, async (req, res) => {
@@ -327,6 +274,17 @@ app.post('/admin/logout', requireAdmin, async (req, res) => {
   res.json({ ok: true });
 });
 
+// Stats
+app.get('/admin/stats', requireAdmin, async (req, res) => {
+  try {
+    const blockedCount = await BlockedDomain.count();
+    const historyCount = await History.count();
+    const usersCount = await UserProfile.count();
+    res.json({ blockedCount, historyCount, usersCount });
+  } catch (e) { res.status(500).json({ error: 'failed' }); }
+});
+
+// Domain management
 app.post('/admin/domains', requireAdmin, async (req, res) => {
   const domain = req.body.domain;
   if (!domain) return res.status(400).json({ error: 'domain required' });
@@ -337,10 +295,7 @@ app.post('/admin/domains', requireAdmin, async (req, res) => {
     await audit(req.admin.u, 'add_domain', host, req.ip);
     await reloadBlockerFromDB();
     res.json({ ok: true, domain: host });
-  } catch (e) {
-    console.error('add domain err', e);
-    res.status(500).json({ error: 'add failed' });
-  }
+  } catch (e) { console.error('add domain err', e); res.status(500).json({ error: 'add failed' }); }
 });
 
 app.get('/admin/domains', requireAdmin, async (req, res) => {
@@ -395,10 +350,7 @@ app.post('/admin/domains/upload', requireAdmin, upload.single('file'), async (re
     await audit(req.admin.u, 'upload_csv', `imported:${results.imported} skipped:${results.skipped}`, req.ip);
     await reloadBlockerFromDB();
     res.json(results);
-  } catch (e) {
-    console.error('csv upload err', e);
-    res.status(500).json({ error: 'upload failed' });
-  }
+  } catch (e) { console.error('csv upload err', e); res.status(500).json({ error: 'upload failed' }); }
 });
 
 app.get('/admin/domains/download', requireAdmin, async (req, res) => {
@@ -417,14 +369,10 @@ app.post('/admin/blocklist/reload', requireAdmin, async (req, res) => {
     await reloadBlockerFromDB();
     await audit(req.admin.u, 'reload_blocklist', 'manual reload', req.ip);
     res.json({ ok: true });
-  } catch (e) {
-    console.error('reload err', e);
-    res.status(500).json({ error: 'reload failed' });
-  }
+  } catch (e) { console.error('reload err', e); res.status(500).json({ error: 'reload failed' }); }
 });
 
 app.get('/admin/users', requireAdmin, async (req, res) => {
-  // aggregate by IP
   const rows = await History.findAll({
     attributes: ['ip_addr', [sequelize.fn('max', sequelize.col('visitedAt')), 'last_seen']],
     group: ['ip_addr'],
@@ -439,7 +387,55 @@ app.get('/admin/audit', requireAdmin, async (req, res) => {
   res.json(rows);
 });
 
-// ---------- Public API ----------
+// ---------- Account endpoints (simple user profile) ----------
+/**
+ * Clients SHOULD store the returned userId in localStorage or cookie and send it as header x-user-id
+ * - POST /api/account { name } -> creates new profile and returns { userId }
+ * - GET /api/account -> returns profile (requires x-user-id header)
+ * - PUT /api/account { name } -> updates profile (requires x-user-id)
+ * - DELETE /api/account -> deletes profile (requires x-user-id)
+ */
+
+app.post('/api/account', async (req, res) => {
+  const name = (req.body.name || '').toString().trim();
+  if (!name) return res.status(400).json({ error: 'name required' });
+  // generate id (random)
+  const id = 'u_' + Math.random().toString(36).slice(2, 12);
+  try {
+    await UserProfile.create({ id, name, created_at: new Date(), updated_at: new Date() });
+    res.json({ ok: true, userId: id, name });
+  } catch (e) { console.error('create profile', e); res.status(500).json({ error: 'create failed' }); }
+});
+
+app.get('/api/account', async (req, res) => {
+  const id = req.header('x-user-id') || req.query.userId;
+  if (!id) return res.status(400).json({ error: 'userId header required' });
+  const p = await UserProfile.findByPk(id);
+  if (!p) return res.status(404).json({ error: 'not found' });
+  res.json({ id: p.id, name: p.name, created_at: p.created_at, updated_at: p.updated_at });
+});
+
+app.put('/api/account', async (req, res) => {
+  const id = req.header('x-user-id') || req.body.userId;
+  if (!id) return res.status(400).json({ error: 'userId required' });
+  const name = (req.body.name || '').toString().trim();
+  if (!name) return res.status(400).json({ error: 'name required' });
+  const p = await UserProfile.findByPk(id);
+  if (!p) return res.status(404).json({ error: 'not found' });
+  p.name = name; p.updated_at = new Date();
+  await p.save();
+  res.json({ ok: true });
+});
+
+app.delete('/api/account', async (req, res) => {
+  const id = req.header('x-user-id') || req.body.userId;
+  if (!id) return res.status(400).json({ error: 'userId required' });
+  await UserProfile.destroy({ where: { id } });
+  await History.destroy({ where: { userId: id } });
+  res.json({ ok: true });
+});
+
+// ---------- Public API endpoints (require API_TOKEN) ----------
 
 app.get('/api/search', requireApiToken, async (req, res) => {
   const q = req.query.q;
@@ -461,13 +457,10 @@ app.get('/api/search', requireApiToken, async (req, res) => {
       data.items = filtered;
     }
     if (req.query.incognito !== '1' && data.items && data.items[0]) {
-      await History.create({ userId: null, url: data.items[0].link, title: data.items[0].title, snippet: data.items[0].snippet || null, visitedAt: new Date(), isIncognito: false, ip_addr: req.ip }).catch(()=>{});
+      await History.create({ userId: req.query.userId || null, url: data.items[0].link, title: data.items[0].title, snippet: data.items[0].snippet || null, visitedAt: new Date(), isIncognito: false, ip_addr: req.ip }).catch(()=>{});
     }
     res.json(data);
-  } catch (e) {
-    console.error('search error', e);
-    res.status(500).json({ error: 'search failed' });
-  }
+  } catch (e) { console.error('search error', e); res.status(500).json({ error: 'search failed' }); }
 });
 
 app.get('/api/proxy', requireApiToken, async (req, res) => {
@@ -475,30 +468,25 @@ app.get('/api/proxy', requireApiToken, async (req, res) => {
   if (!target) return res.status(400).json({ error: 'url required' });
   try {
     if (await isBlockedUrl(target)) {
-      await History.create({ url: target, isIncognito: false, ip_addr: req.ip }).catch(()=>{});
+      await History.create({ userId: req.query.userId || null, url: target, isIncognito: false, ip_addr: req.ip }).catch(()=>{});
       return res.status(403).json({ blocked: true });
     }
-    const r = await fetch(target, { headers: { 'User-Agent': 'RenderBrowserBackend/1.0' }, redirect: 'follow' });
+    const r = await fetch(target, { headers: { 'User-Agent': 'DeepBrowserBackend/1.0' }, redirect: 'follow' });
     const ct = r.headers.get('content-type') || '';
     if (ct.includes('text/html') && req.query.sanitize === '1') {
       let html = await r.text();
       const $ = cheerio.load(html);
-      // remove blocked external resource elements
       const removals = [];
       $('script, iframe, link[rel="stylesheet"]').each((i, el) => {
         const src = $(el).attr('src') || $(el).attr('href') || '';
         if (src) removals.push({ el, src });
       });
-      // evaluate removals sequentially (await checks)
       for (const it of removals) {
         try {
           const blocked = await isBlockedUrl(it.src);
-          if (blocked) {
-            $(it.el).remove();
-          }
+          if (blocked) $(it.el).remove();
         } catch (e) { /* ignore */ }
       }
-      // remove inline event handlers
       $('[onclick],[onload],[onerror]').each((i, el) => {
         $(el).removeAttr('onclick').removeAttr('onload').removeAttr('onerror');
       });
@@ -509,50 +497,44 @@ app.get('/api/proxy', requireApiToken, async (req, res) => {
       r.body.pipe(res);
     }
     if (req.query.incognito !== '1') {
-      await History.create({ url: target, isIncognito: false, ip_addr: req.ip }).catch(()=>{});
+      await History.create({ userId: req.query.userId || null, url: target, isIncognito: false, ip_addr: req.ip }).catch(()=>{});
     }
-  } catch (e) {
-    console.error('proxy fetch failed', e);
-    res.status(502).json({ error: 'fetch failed' });
-  }
+  } catch (e) { console.error('proxy fetch failed', e); res.status(502).json({ error: 'fetch failed' }); }
 });
 
 app.get('/api/history', requireApiToken, async (req, res) => {
-  const limit = Math.min(100, parseInt(req.query.limit || '50'));
-  const rows = await History.findAll({ order: [['visitedAt', 'DESC']], limit });
+  const limit = Math.min(200, parseInt(req.query.limit || '50'));
+  const where = {};
+  if (req.query.userId) where.userId = req.query.userId;
+  const rows = await History.findAll({ where, order: [['visitedAt', 'DESC']], limit });
   res.json(rows);
 });
 app.post('/api/history', requireApiToken, async (req, res) => {
   const { url, title, incognito } = req.body;
   if (!url) return res.status(400).json({ error: 'url required' });
-  await History.create({ url, title: title||null, isIncognito: !!incognito, ip_addr: req.ip }).catch(e => console.warn(e));
+  await History.create({ userId: req.body.userId || null, url, title: title||null, isIncognito: !!incognito, ip_addr: req.ip }).catch(e => console.warn(e));
   res.json({ ok: true });
 });
 
-// Health
+// Health + friendly root (index.html served from public/)
 app.get('/health', (req, res) => res.json({ ok: true }));
+app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 
 // ---------- Initialize DB, blocklists, and start server ----------
 (async function init() {
   try {
-    // Authenticate and create tables
     await sequelize.authenticate();
     await Admin.sync();
     await BlockedDomain.sync();
     await History.sync();
     await AdminAudit.sync();
+    await UserProfile.sync();
     console.log('[DB] SQLite connected & models synced at', SQLITE_FILE);
 
-    // Build & load blocklists after tables exist
-    try {
-      await buildBlocklistFileFromDBAndSources();
-      loadBlocklistsFromFile();
-      console.log('[Blocker] initial blocklist built and loaded');
-    } catch (err) {
-      console.warn('[Blocker] initial build/load failed', err && err.message);
-    }
+    // build & load blocklist after tables exist
+    try { await buildBlocklistFileFromDBAndSources(); loadBlocklistsFromFile(); console.log('[Blocker] initial blocklist built and loaded'); }
+    catch (err) { console.warn('[Blocker] initial build/load failed', err && err.message); }
 
-    // Start server only after DB+blocklist ready
     app.listen(PORT, () => {
       console.log(`server listening on ${PORT}`);
       console.log('==> Your service is live');
