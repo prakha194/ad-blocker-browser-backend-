@@ -1,5 +1,5 @@
 {
-  "name": "browser-backend-sqlite",
+  "name": "deep-browser-backend",
   "version": "1.0.0",
   "main": "server.js",
   "scripts": {
